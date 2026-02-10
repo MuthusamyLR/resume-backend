@@ -1,179 +1,183 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from openai import OpenAI
 import pdfplumber
 from reportlab.pdfgen import canvas
 import uuid
 import os
 
-# Initialize FastAPI app
+# Load API key from environment variable
+api_key = os.getenv("DEEPSEEK_API_KEY")
+
+if not api_key:
+    raise ValueError("DEEPSEEK_API_KEY not set")
+
+client = OpenAI(
+    api_key=api_key,
+    base_url="https://api.deepseek.com"
+)
+
 app = FastAPI()
 
-# Enable CORS (allows your Hostinger frontend to call backend)
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Later you can restrict to your domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load DeepSeek API key securely from environment
-api_key = os.getenv("DEEPSEEK_API_KEY")
+# Folder to store generated PDFs
+OUTPUT_DIR = "generated"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-client = None
 
-if api_key:
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.deepseek.com"
-    )
-
-# Home route for testing
 @app.get("/")
 def home():
     return {"status": "Resume Optimizer Backend Running"}
 
-# Function to extract text from uploaded PDF
-def extract_text_from_pdf(file):
 
-    try:
-        text = ""
+# -------- PDF TEXT EXTRACTION --------
 
-        with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
+def extract_text(file):
+    text = ""
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
 
-        return text
 
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Failed to read PDF file"
-        )
+# -------- AI OPTIMIZATION --------
 
-# Function to optimize resume using DeepSeek
-def optimize_resume(resume_text):
-
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="AI service temporarily unavailable"
-        )
+def optimize_resume(text):
 
     prompt = f"""
-You are a professional ATS resume optimizer.
+You are an expert ATS resume optimizer.
 
-Analyze the resume and improve it.
+Improve this resume professionally.
 
-Return strictly in this format:
+Return JSON format only:
 
-ATS SCORE: number
-
-OPTIMIZED RESUME:
-
-Full professional ATS-optimized resume.
+{{
+  "optimized_text": "full optimized resume text"
+}}
 
 Resume:
-{resume_text}
+{text}
 """
 
-    try:
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "You are a professional resume writer."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.2
+    )
 
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=[
-                {"role": "system", "content": "You are an expert ATS resume optimizer."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2,
-            max_tokens=2000
-        )
+    return response.choices[0].message.content
 
-        return response.choices[0].message.content
 
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="AI optimization failed"
-        )
+# -------- PDF GENERATION --------
 
-# Function to create PDF from optimized text
 def create_pdf(content):
 
-    try:
+    filename = f"optimized_resume_{uuid.uuid4()}.pdf"
+    path = os.path.join(OUTPUT_DIR, filename)
 
-        filename = f"optimized_resume_{uuid.uuid4()}.pdf"
+    c = canvas.Canvas(path)
 
-        c = canvas.Canvas(filename)
+    y = 800
 
-        y = 800
+    for line in content.split("\n"):
+        c.drawString(50, y, line)
+        y -= 20
 
-        for line in content.split("\n"):
+        if y < 50:
+            c.showPage()
+            y = 800
 
-            if y < 50:
-                c.showPage()
-                y = 800
+    c.save()
 
-            c.drawString(50, y, line)
-            y -= 20
+    return filename
 
-        c.save()
 
-        return filename
+# -------- PDF UPLOAD ENDPOINT --------
 
-    except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to create PDF"
-        )
-
-# Optimize endpoint
 @app.post("/optimize")
 async def optimize(file: UploadFile = File(...)):
 
-    if not file.filename.endswith(".pdf"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed"
-        )
+    text = extract_text(file.file)
 
-    # Extract text
-    resume_text = extract_text_from_pdf(file.file)
+    optimized = optimize_resume(text)
 
-    if not resume_text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="PDF contains no readable text"
-        )
+    filename = create_pdf(optimized)
 
-    # Optimize resume
-    optimized_text = optimize_resume(resume_text)
-
-    # Create optimized PDF
-    pdf_file = create_pdf(optimized_text)
-
-    return {
+    return JSONResponse({
         "success": True,
-        "optimized_text": optimized_text,
-        "download_url": f"/download/{pdf_file}"
-    }
+        "optimized_text": optimized,
+        "download_url": f"/download/{filename}"
+    })
 
-# Download endpoint
+
+# -------- STRUCTURED BUILDER ENDPOINT --------
+
+@app.post("/optimize/structured")
+async def optimize_structured(
+    name: str = Form(...),
+    email: str = Form(...),
+    phone: str = Form(""),
+    skills: str = Form(""),
+    projects: str = Form(""),
+    experience: str = Form(""),
+    education: str = Form("")
+):
+
+    structured_text = f"""
+Name: {name}
+Email: {email}
+Phone: {phone}
+
+Skills:
+{skills}
+
+Projects:
+{projects}
+
+Experience:
+{experience}
+
+Education:
+{education}
+"""
+
+    optimized = optimize_resume(structured_text)
+
+    filename = create_pdf(optimized)
+
+    return JSONResponse({
+        "success": True,
+        "optimized_text": optimized,
+        "download_url": f"/download/{filename}"
+    })
+
+
+# -------- DOWNLOAD ENDPOINT --------
+
 @app.get("/download/{filename}")
-def download_file(filename: str):
+def download(filename: str):
 
-    if not os.path.exists(filename):
-        raise HTTPException(
-            status_code=404,
-            detail="File not found"
-        )
+    path = os.path.join(OUTPUT_DIR, filename)
+
+    if not os.path.exists(path):
+        return JSONResponse({"error": "File not found"}, status_code=404)
 
     return FileResponse(
-        path=filename,
-        filename=filename,
-        media_type="application/pdf"
+        path,
+        media_type="application/pdf",
+        filename=filename
     )
